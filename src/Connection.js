@@ -72,3 +72,55 @@ Connection.prototype.connect = function(callback) {
     this.emit("connecting", this._address());
     return this;
 }
+
+/**
+ * Closes the current connection.
+ * @return {Connection}
+ */
+Connection.prototype.close = function() {
+    if (this.connected()) {
+        this.transport.end();
+    }
+    delete this.transport;
+    this.emit('closed', this._address());;
+    return this;
+}
+
+/**
+ * Disconnects from the server.
+ * @return {Connection}
+ */
+Connection.prototype.disconnect = function() {
+    this.close(false);
+    return this;
+}
+
+/**
+ * Check if connection attempt is being made.
+ * @return {boolean} True or false depending on if connection attempt is being made
+ */
+Coonnection.prototype.connecting = function() {
+    return this.transport != null && this.transport._connecting;
+}
+
+/**
+ * Checks if connection attempt has been negotiated
+ * @return {boolean} True or false depending on if connection as been negotiated
+ */
+Connection.prototype.connected = function() {
+    return this.transport != null && !this.transport._connecting;
+}
+
+Connection.prototype._handleSockedEnd = function() {
+    this.emit("diconnected", this._address());
+}
+
+Connection.prototype._handleSocketError = function() {
+    this.emit("connection_error", this._address(), error);
+    this.close();
+}
+
+Connection.prototype._handleSocketConnect = function() {
+    this.transport.on('close', _.bind(this.close, this));
+    this.emit("connected", this._address());
+}
