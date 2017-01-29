@@ -19,6 +19,7 @@
   "dependencies": {
     "events": "^1.1.1",
     "net": "^1.0.2",
+    "std": "^0.1.40",
     "underscore": "^1.8.3"
   }
 }
