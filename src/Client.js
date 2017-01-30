@@ -1,9 +1,16 @@
 var _ = require('underscore'),
     Connection = require('./Connection'),
+    states = require('./States'),
+    error = require('./Errors'),
     //make simple
     EventEmitter = require('events').EventEmitter,
     bigint = require('bigint'),
+    std = require('std'),
     requestTypes = require('./RequestTypes');
+
+var LATEST_TIME = -1
+var EARLIEST_TIME = -1
+var MAGIC_VALUE = 0
 
 var Client = module.exports = function Client(options) {
 
@@ -99,6 +106,11 @@ Client.prototype.getStats = function() {
 
 Client.prototype.getMaxFetchSize = function() {
     return this.options.maxSize;
+}
+
+Client.prototype._reset = function() {
+    this._toRead = 0
+    this._state = states.HEADER_LEN_0
 }
 
 Client.prototype.clearRequests = function() {
@@ -208,4 +220,341 @@ Client.prototype._pushSendRequest = function(requestObj) {
     }
     this._sendRequests.push(requestObj);
     this._writeRequest(requestObj);
+}
+
+Client.prototype._pushRequest = function(requestObj) {
+    this._requests.push(requestObj)
+    this._writeRequest(requestObj)
+}
+
+Client.prototype._writeRequest = function(requestObj) {
+    if (this._autoConnectOnWrite && !this.connection.connected() && !this.connection.connecting()) {
+        this.connect();
+        return;
+    }
+    if (!this.connected()) {
+        return;
+    }
+    if (!this.connection.transport.writable) {
+        this.close();
+    } else {
+        this.connection.transport.write(requestObj.request, encode(requestObj.request), 'utf8', requestObj.callback);
+    }
+}
+
+Client.prototype._encodeFetchRequest = function(t) {
+    var offset = bigint(t.offset);
+    var request = std.pack('n', t.type) +
+        std.pack('n', t.name.length) +
+        t.name +
+        std.pack('N', t.partition) +
+        std.pack('N', offset.shiftRight(32).and(0xffffffff)) +
+        std.pack('N', offset.and(0xffffffff)) +
+        std.pack('N', (t.maxSize == undefined) ? this._buffer.length : t.maxSize);
+
+    var requestSize = 2 + 2 + t.name.length + 4 + 8 + 4;
+    return this._bufferPacket(std.pack('N', requestSize) + request);
+}
+
+Client.prototype._encodeOffsetsRequest = function(t) {
+    var request = std.pack('n', t.type) +
+        std.pack('n', t.name.length) + t.name +
+        std.pack('N', t.partition) +
+        std.pack('N2', -1, -1) +
+        std.pack('N', t.offsets);
+
+    var requestSize = 2 + 2 + t.name.length + 4 + 8 + 4;
+    return this._bufferPacket(std.pack('N', requestSize) + request);
+}
+
+//
+Client.prototype._encodeSendRequest = function(t) {
+    var encodedMessages = ''
+    for (var i = 0; i < t.messages.length; i++) {
+        var encodedMessage = this._encodeMessage(t.messages[i])
+        encodedMessages += std.pack('N', encodedMessage.length) + encodedMessage
+    }
+
+    var request = std.pack('n', t.type) +
+        std.pack('n', t.topic.length) + t.topic +
+        std.pack('N', t.partition) +
+        std.pack('N', encodedMessages.length) + encodedMessages
+
+    return this._bufferPacket(std.pack('N', request.length) + request)
+}
+//
+Client.prototype._encodeMessage = function(message) {
+    return std.pack('CN', MAGIC_VALUE, std.crc32(message)) + message
+}
+
+//
+Client.prototype._onData = function(buf) {
+    if (this._requests[0] == undefined) return
+    var index = 0
+    while (index != buf.length) {
+        var bytes = 1
+        var next = this._state + 1
+        switch (this._state) {
+            case states.ERROR:
+                // just eat the bytes until done
+                next = states.ERROR
+                break
+
+            case states.HEADER_LEN_0:
+                this._totalLen = buf[index] << 24
+                break
+
+            case states.HEADER_LEN_1:
+                this._totalLen += buf[index] << 16
+                break
+
+            case states.HEADER_LEN_2:
+                this._totalLen += buf[index] << 8
+                break
+
+            case states.HEADER_LEN_3:
+                this._totalLen += buf[index]
+                break
+
+            case states.HEADER_EC_0:
+                this._error = buf[index] << 8
+                this._totalLen--
+                    break
+
+            case states.HEADER_EC_1:
+                this._error += buf[index]
+                this._toRead = this._totalLen
+                next = this._requests[0].request.next
+                this._totalLen--
+                    if (this._error != error.NoError) this.emit('messageerror',
+                        this._requests[0].request.name,
+                        this._requests[0].request.partition,
+                        this._error,
+                        error[this._error])
+                break
+
+            case states.RESPONSE_MSG_0:
+                this._msgLen = buf[index] << 24
+                this._requests[0].request.last_offset = bigint(this._requests[0].request.offset)
+                this._requests[0].request.offset++
+                    this._payloadLen = 0
+                break
+
+            case states.RESPONSE_MSG_1:
+                this._msgLen += buf[index] << 16
+                this._requests[0].request.offset++
+                    break
+
+            case states.RESPONSE_MSG_2:
+                this._msgLen += buf[index] << 8
+                this._requests[0].request.offset++
+                    break
+
+            case states.RESPONSE_MSG_3:
+                this._msgLen += buf[index]
+                this._requests[0].request.offset++
+                    if (this._msgLen > this._totalLen) {
+                        this.emit("parseerror",
+                            this._requests[0].request.name,
+                            this._requests[0].request.partition,
+                            "unexpected message len " + this._msgLen + " > " + this._totalLen +
+                            " for topic: " + this._requests[0].request.name +
+                            ", partition: " + this._requests[0].request.partition +
+                            ", original_offset:" + this._requests[0].request.original_offset +
+                            ", last_offset: " + this._requests[0].request.last_offset)
+                        this._error = error.InvalidMessage
+                        next = states.ERROR
+                    }
+                break
+
+            case states.RESPONSE_MAGIC:
+                this._magic = buf[index]
+                this._requests[0].request.offset++
+                    this._msgLen--
+                    if (false && Math.random() * 20 > 18) this._magic = 5
+                switch (this._magic) {
+                    case 0:
+                        next = states.RESPONSE_CHKSUM_0
+                        break
+                    case 1:
+                        next = states.RESPONSE_COMPRESSION
+                        break
+                    default:
+                        this.emit("parseerror",
+                            this._requests[0].request.name,
+                            this._requests[0].request.partition,
+                            "unexpected message format - bad magic value " + this._magic +
+                            " for topic: " + this._requests[0].request.name +
+                            ", partition: " + this._requests[0].request.partition +
+                            ", original_offset:" + this._requests[0].request.original_offset +
+                            ", last_offset: " + this._requests[0].request.last_offset)
+                        this._error = error.InvalidMessage
+                        next = states.ERROR
+                }
+                break
+
+            case states.RESPONSE_COMPRESSION:
+                this._msgLen--
+                    this._requests[0].request.offset++
+                    if (buf[index] > 0) {
+                        this.emit("parseerror",
+                            this._requests[0].request.name,
+                            this._requests[0].request.partition,
+                            "unexpected message format - bad compression flag " +
+                            " for topic: " + this._requests[0].request.name +
+                            ", partition: " + this._requests[0].request.partition +
+                            ", original_offset:" + this._requests[0].request.original_offset +
+                            ", last_offset: " + this._requests[0].request.last_offset)
+                        this._error = error.InvalidMessage
+                        next = states.ERROR
+                    }
+                break
+
+            case states.RESPONSE_CHKSUM_0:
+                this._chksum = buf[index] << 24
+                this._requests[0].request.offset++
+                    this._msgLen--
+                    break
+
+            case states.RESPONSE_CHKSUM_1:
+                this._chksum += buf[index] << 16
+                this._requests[0].request.offset++
+                    this._msgLen--
+                    break
+
+            case states.RESPONSE_CHKSUM_2:
+                this._chksum += buf[index] << 8
+                this._requests[0].request.offset++
+                    this._msgLen--
+                    break
+
+            case states.RESPONSE_CHKSUM_3:
+                this._chksum += buf[index]
+                this._requests[0].request.offset++
+                    this._msgLen--
+                    break
+
+            case states.RESPONSE_MSG:
+                next = states.RESPONSE_MSG
+
+                // try to avoid a memcpy if possible
+                var payload = null
+                if (this._payloadLen == 0 && buf.length - index >= this._msgLen) {
+                    payload = buf.toString('utf8', index, index + this._msgLen)
+                    bytes = this._msgLen
+                } else {
+                    var end = index + this._msgLen - this._payloadLen
+                    if (end > buf.length) end = buf.length
+                    buf.copy(this._buffer, this._payloadLen, index, end)
+                    this._payloadLen += end - index
+                    bytes = end - index
+                    if (this._payloadLen == this._msgLen) {
+                        payload = this._buffer.toString('utf8', 0, this._payloadLen)
+                    }
+                }
+                if (payload != null) {
+                    this._requests[0].request.offset += this._msgLen
+                    next = states.RESPONSE_MSG_0
+                    this.emit('message', this._requests[0].request.name, payload, bigint(this._requests[0].request.offset))
+                }
+                break
+
+            case states.OFFSET_LEN_0:
+                this._msgLen = buf[index] << 24
+                break
+
+            case states.OFFSET_LEN_1:
+                this._msgLen += buf[index] << 16
+                break
+
+            case states.OFFSET_LEN_2:
+                this._msgLen += buf[index] << 8
+                break
+
+            case states.OFFSET_LEN_3:
+                this._msgLen += buf[index]
+                break
+
+            case states.OFFSET_OFFSETS_0:
+                this._requests[0].request.offset_buffer = new Buffer(8)
+                this._requests[0].request.offset_buffer[0] = buf[index]
+                break
+
+            case states.OFFSET_OFFSETS_1:
+                this._requests[0].request.offset_buffer[1] = buf[index]
+                break
+
+            case states.OFFSET_OFFSETS_2:
+                this._requests[0].request.offset_buffer[2] = buf[index]
+                break
+
+            case states.OFFSET_OFFSETS_3:
+                this._requests[0].request.offset_buffer[3] = buf[index]
+                break
+
+            case states.OFFSET_OFFSETS_4:
+                this._requests[0].request.offset_buffer[4] = buf[index]
+                break
+
+            case states.OFFSET_OFFSETS_5:
+                this._requests[0].request.offset_buffer[5] = buf[index]
+                break
+
+            case states.OFFSET_OFFSETS_6:
+                this._requests[0].request.offset_buffer[6] = buf[index]
+                break
+
+            case states.OFFSET_OFFSETS_7:
+                this._requests[0].request.offset_buffer[7] = buf[index]
+                this._requests[0].request.offset = bigint.fromBuffer(this._requests[0].request.offset_buffer)
+                next = states.OFFSET_OFFSETS_0
+                this.emit('offset', this._requests[0].request.name, bigint(this._requests[0].request.offset))
+        }
+        if (this._requests[0] == undefined) break
+        this._requests[0].request.bytesRead += bytes
+        index += bytes
+        this._toRead -= bytes
+        this._state = next
+        if (this._toRead == 0) this._last()
+    }
+}
+
+///
+Client.prototype._last = function() {
+    var last = this._requests.shift()
+
+    // we don't know if we got all the messages if we got a buffer full of data
+    // so re-request the topic at the last parsed offset, otherwise, emit last
+    // message to tell client we are done
+    if (last.request.bytesRead >= this._buffer.length) {
+        // when we request data from kafka, it just sends us a buffer from disk, limited
+        // by the maximum amount of data we asked for (plus a few more for the header len)
+        // the end of this data may or may not end on an actual message boundary, and we
+        // may have processed an offset header, but not the actual message
+        // because the state machine automatically sets the request offset to the offset
+        // that is read, we have to detect here if we stopped before the message
+        // boundary (the message state will be other than the start of a new mesage).
+        //
+        // If we did, reset the offset to the last known offset which is
+        // saved before processing the offset bytes.
+        if (this._state != states.RESPONSE_MSG_0) {
+            last.request.offset = bigint(last.request.last_offset)
+        }
+
+        this.fetchTopic(last.request)
+    } else {
+        this.emit(last.request.last, last.request.name, bigint(last.request.offset), this._error, error[this._error])
+    }
+    this._state = states.HEADER_LEN_0
+}
+
+Client.prototype._bufferPacket = function(packet) {
+    var len = packet.length,
+        buffer = new Buffer(len)
+
+    for (var i = 0; i < len; i++) {
+        buffer[i] = packet.charCodeAt(i)
+    }
+
+    return buffer
 }
