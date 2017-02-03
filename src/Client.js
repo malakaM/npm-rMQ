@@ -4,7 +4,7 @@ var _ = require('underscore'),
     error = require('./Errors'),
     //make simple
     EventEmitter = require('events').EventEmitter,
-    bigint = require('bigint'),
+    bignum = require('bignum'),
     std = require('std'),
     requestTypes = require('./RequestTypes');
 
@@ -135,7 +135,7 @@ Client.prototype.fetchTopic = function(args) {
         throw new Error('Fetch topic invalid parameter, must be name or complex object');
     }
 
-    request.original_offset = bigint(request.offset);
+    request.original_offset = bignum(request.offset);
     request.bytesRead = 0;
     this._pushRequest({
         request: request
@@ -243,7 +243,7 @@ Client.prototype._writeRequest = function(requestObj) {
 }
 
 Client.prototype._encodeFetchRequest = function(t) {
-    var offset = bigint(t.offset);
+    var offset = bignum(t.offset);
     var request = std.pack('n', t.type) +
         std.pack('n', t.name.length) +
         t.name +
@@ -335,7 +335,7 @@ Client.prototype._onData = function(buf) {
 
             case states.RESPONSE_MSG_0:
                 this._msgLen = buf[index] << 24
-                this._requests[0].request.last_offset = bigint(this._requests[0].request.offset)
+                this._requests[0].request.last_offset = bignum(this._requests[0].request.offset)
                 this._requests[0].request.offset++
                     this._payloadLen = 0
                 break
@@ -455,7 +455,7 @@ Client.prototype._onData = function(buf) {
                 if (payload != null) {
                     this._requests[0].request.offset += this._msgLen
                     next = states.RESPONSE_MSG_0
-                    this.emit('message', this._requests[0].request.name, payload, bigint(this._requests[0].request.offset))
+                    this.emit('message', this._requests[0].request.name, payload, bignum(this._requests[0].request.offset))
                 }
                 break
 
@@ -506,9 +506,9 @@ Client.prototype._onData = function(buf) {
 
             case states.OFFSET_OFFSETS_7:
                 this._requests[0].request.offset_buffer[7] = buf[index]
-                this._requests[0].request.offset = bigint.fromBuffer(this._requests[0].request.offset_buffer)
+                this._requests[0].request.offset = bignum.fromBuffer(this._requests[0].request.offset_buffer)
                 next = states.OFFSET_OFFSETS_0
-                this.emit('offset', this._requests[0].request.name, bigint(this._requests[0].request.offset))
+                this.emit('offset', this._requests[0].request.name, bignum(this._requests[0].request.offset))
         }
         if (this._requests[0] == undefined) break
         this._requests[0].request.bytesRead += bytes
@@ -538,12 +538,12 @@ Client.prototype._last = function() {
         // If we did, reset the offset to the last known offset which is
         // saved before processing the offset bytes.
         if (this._state != states.RESPONSE_MSG_0) {
-            last.request.offset = bigint(last.request.last_offset)
+            last.request.offset = bignum(last.request.last_offset)
         }
 
         this.fetchTopic(last.request)
     } else {
-        this.emit(last.request.last, last.request.name, bigint(last.request.offset), this._error, error[this._error])
+        this.emit(last.request.last, last.request.name, bignum(last.request.offset), this._error, error[this._error])
     }
     this._state = states.HEADER_LEN_0
 }

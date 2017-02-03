@@ -17,6 +17,7 @@
   },
   "homepage": "https://github.com/malakaM/npm-rMQ#readme",
   "dependencies": {
+    "bignum": "^0.12.5",
     "events": "^1.1.1",
     "net": "^1.0.2",
     "std": "^0.1.40",
